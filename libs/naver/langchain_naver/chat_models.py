@@ -3,14 +3,18 @@ from __future__ import annotations
 import uuid
 from typing import (
     Any,
+    Callable,
     Dict,
     List,
     Mapping,
     Optional,
     Tuple,
+    Type,
     Union,
+    cast,
 )
 
+import langchain_openai
 import openai
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
@@ -22,17 +26,62 @@ from langchain_core.language_models.chat_models import (
     agenerate_from_stream,
     generate_from_stream,
 )
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import (
+    BaseMessage,
+    BaseMessageChunk,
+)
+from langchain_core.messages.ai import AIMessageChunk
 from langchain_core.outputs import ChatResult
+from langchain_core.runnables import run_in_executor
 from langchain_core.utils import from_env, secret_from_env
 from langchain_openai.chat_models.base import (
     BaseChatOpenAI,
+    _convert_delta_to_message_chunk,
+    _convert_dict_to_message,
     _convert_message_to_dict,
+    _handle_openai_bad_request,
+    global_ssl_context,
 )
 from pydantic import Field, SecretStr, model_validator
 from typing_extensions import Self
 
 from langchain_naver.const import USER_AGENT
+
+
+def decorator_convert_delta_to_message_chunk(wrapped_func: Callable) -> Callable:
+    def wrapping_func(
+        _dict: Mapping[str, Any], default_class: Type[BaseMessageChunk]
+    ) -> BaseMessageChunk:
+        role = cast(str, _dict.get("role"))
+        chunk = wrapped_func(_dict, default_class)
+        if role == "assistant" or default_class == AIMessageChunk:
+            reasoning_content = cast(str, _dict.get("reasoning_content") or "")
+            chunk.additional_kwargs["thinking_content"] = reasoning_content
+        return chunk
+
+    return wrapping_func
+
+
+langchain_openai.chat_models.base._convert_delta_to_message_chunk = (
+    decorator_convert_delta_to_message_chunk(_convert_delta_to_message_chunk)
+)
+
+
+def decorator_convert_dict_to_message(wrapped_func: Callable) -> Callable:
+    def wrapping_func(_dict: Mapping[str, Any]) -> BaseMessage:
+        message = wrapped_func(_dict)
+        role = cast(str, _dict.get("role"))
+        if "reasoning_content" in _dict and role == "assistant":
+            reasoning_content = _dict.get("reasoning_content", "")
+            message.additional_kwargs["thinking_content"] = reasoning_content
+        return message
+
+    return wrapping_func
+
+
+langchain_openai.chat_models.base._convert_dict_to_message = (
+    decorator_convert_dict_to_message(_convert_dict_to_message)
+)
 
 
 def _convert_payload_messages(payload: dict) -> None:
@@ -86,6 +135,10 @@ class ChatClovaX(BaseChatOpenAI):
         """Get the parameters used to invoke the model."""
         params = super()._get_ls_params(stop=stop, **kwargs)
         params["ls_provider"] = "naver"
+        if ls_max_tokens := params.get("max_tokens", self.max_tokens) or params.get(
+            "max_completion_tokens", self.max_tokens
+        ):
+            params["ls_max_tokens"] = ls_max_tokens  # type: ignore[typeddict-item]
         return params
 
     model_name: str = Field(default="HCX-005", alias="model")
@@ -130,6 +183,11 @@ class ChatClovaX(BaseChatOpenAI):
     repeat_penalty: Optional[float] = Field(gt=0.0, le=10, default=None)
     """같은 토큰을 생성하는 것에 대한 패널티 정도(설정값이 높을수록 같은 결괏값을 
     반복 생성할 확률 감소). Chat Completion API에서만 사용 가능."""
+    max_tokens: Optional[int] = Field(default=None, alias="max_completion_tokens")
+    """Maximum number of tokens to generate."""
+    thinking: Optional[Mapping[str, str]] = Field(default=None)
+    """Enable thinking mode, which allows the model to think before generating 
+    a response."""
 
     @model_validator(mode="after")
     def validate_environment(self) -> Self:
@@ -156,18 +214,61 @@ class ChatClovaX(BaseChatOpenAI):
             self.extra_body["repetition_penalty"] = self.repetition_penalty
         if self.repeat_penalty is not None:
             self.extra_body["repeat_penalty"] = self.repeat_penalty
+        if self.thinking is not None and "effort" in self.thinking:
+            self.reasoning_effort = self.thinking["effort"]
 
-        if not (self.client or None):
-            sync_specific: dict = {"http_client": self.http_client}
-            self.client = openai.OpenAI(
-                **client_params, **sync_specific
-            ).chat.completions
-        if not (self.async_client or None):
-            async_specific: dict = {"http_client": self.http_async_client}
-            self.async_client = openai.AsyncOpenAI(
-                **client_params, **async_specific
-            ).chat.completions
+        if self.openai_proxy and (self.http_client or self.http_async_client):
+            openai_proxy = self.openai_proxy
+            http_client = self.http_client
+            http_async_client = self.http_async_client
+            raise ValueError(
+                "Cannot specify 'openai_proxy' if one of "
+                "'http_client'/'http_async_client' is already specified. Received:\n"
+                f"{openai_proxy=}\n{http_client=}\n{http_async_client=}"
+            )
+        if not self.client:
+            if self.openai_proxy and not self.http_client:
+                try:
+                    import httpx
+                except ImportError as e:
+                    raise ImportError(
+                        "Could not import httpx python package. "
+                        "Please install it with `pip install httpx`."
+                    ) from e
+                self.http_client = httpx.Client(
+                    proxy=self.openai_proxy, verify=global_ssl_context
+                )
+            sync_specific = {"http_client": self.http_client}
+            self.root_client = openai.OpenAI(**client_params, **sync_specific)  # type: ignore[arg-type]
+            self.client = self.root_client.chat.completions
+        if not self.async_client:
+            if self.openai_proxy and not self.http_async_client:
+                try:
+                    import httpx
+                except ImportError as e:
+                    raise ImportError(
+                        "Could not import httpx python package. "
+                        "Please install it with `pip install httpx`."
+                    ) from e
+                self.http_async_client = httpx.AsyncClient(
+                    proxy=self.openai_proxy, verify=global_ssl_context
+                )
+            async_specific = {"http_client": self.http_async_client}
+            self.root_async_client = openai.AsyncOpenAI(
+                **client_params,
+                **async_specific,  # type: ignore[arg-type]
+            )
+            self.async_client = self.root_async_client.chat.completions
         return self
+
+    @property
+    def _default_params(self) -> Dict[str, Any]:
+        """Get the default parameters for calling OpenAI API."""
+        params = super()._default_params
+        if "max_tokens" in params:
+            params["max_completion_tokens"] = params.pop("max_tokens")
+
+        return params
 
     def _create_message_dicts(
         self, messages: List[BaseMessage], stop: Optional[List[str]]
@@ -192,10 +293,21 @@ class ChatClovaX(BaseChatOpenAI):
             return generate_from_stream(stream_iter)
         payload = self._get_request_payload(messages, stop=stop, **kwargs)
         _convert_payload_messages(payload)
-        response = self.client.create(
-            **payload,
-            extra_headers={"X-NCP-CLOVASTUDIO-REQUEST-ID": f"lcnv-{str(uuid.uuid4())}"},
-        )
+        extra_headers = {"X-NCP-CLOVASTUDIO-REQUEST-ID": f"lcnv-{str(uuid.uuid4())}"}
+        if "response_format" in payload:
+            payload.pop("stream")
+            try:
+                response = self.root_client.beta.chat.completions.parse(
+                    **payload,
+                    extra_headers=extra_headers,
+                )
+            except openai.BadRequestError as e:
+                _handle_openai_bad_request(e)
+        else:
+            response = self.client.create(
+                **payload,
+                extra_headers=extra_headers,
+            )
         return self._create_chat_result(response)
 
     async def _agenerate(
@@ -213,11 +325,25 @@ class ChatClovaX(BaseChatOpenAI):
 
         payload = self._get_request_payload(messages, stop=stop, **kwargs)
         _convert_payload_messages(payload)
-        response = await self.async_client.create(
-            **payload,
-            extra_headers={"X-NCP-CLOVASTUDIO-REQUEST-ID": f"lcnv-{str(uuid.uuid4())}"},
+        generation_info = None
+        extra_headers = {"X-NCP-CLOVASTUDIO-REQUEST-ID": f"lcnv-{str(uuid.uuid4())}"}
+        if "response_format" in payload:
+            payload.pop("stream")
+            try:
+                response = await self.root_async_client.beta.chat.completions.parse(
+                    **payload,
+                    extra_headers=extra_headers,
+                )
+            except openai.BadRequestError as e:
+                _handle_openai_bad_request(e)
+        else:
+            response = await self.async_client.create(
+                **payload,
+                extra_headers=extra_headers,
+            )
+        return await run_in_executor(
+            None, self._create_chat_result, response, generation_info
         )
-        return self._create_chat_result(response)
 
     def _get_request_payload(
         self,

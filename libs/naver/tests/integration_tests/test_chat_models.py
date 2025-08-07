@@ -169,7 +169,7 @@ def test_invoke_with_extra_body() -> None:
 
 def test_invoke_bind_tools() -> None:
     """Test function call from ChatClovaX."""
-    llm = ChatClovaX(max_tokens=2048, top_k=5, repetition_penalty=1.0)
+    llm = ChatClovaX(max_tokens=2048, top_k=5, repetition_penalty=1.0)  # type: ignore[call-arg]
     chat_with_tool = llm.bind_tools([GetWeather])
     result = chat_with_tool.invoke("분당과 판교 중 어디가 더 덥지?")
     assert isinstance(result, AIMessage)
@@ -179,7 +179,7 @@ def test_invoke_bind_tools() -> None:
 
 async def test_ainvoke_bind_tools() -> None:
     """Test function call from ChatClovaX."""
-    llm = ChatClovaX(max_tokens=2048, top_k=5, repetition_penalty=1.0)
+    llm = ChatClovaX(max_tokens=2048, top_k=5, repetition_penalty=1.0)  # type: ignore[call-arg]
     chat_with_tool = llm.bind_tools([GetWeather])
     result = await chat_with_tool.ainvoke("분당과 판교 중 어디가 더 덥지?")
     assert isinstance(result, AIMessage)
@@ -199,7 +199,7 @@ def test_langgraph_create_react_agent() -> None:
     # Define the chat model
     chat = ChatClovaX(
         model="HCX-005",
-        max_tokens=1024,
+        max_tokens=1024,  # type: ignore[call-arg]
         disable_streaming=True,
     )
 
@@ -231,3 +231,138 @@ async def test_astream_error_event() -> None:
     with pytest.raises(ValueError):
         async for _ in llm.astream(prompt * 1000):
             pass
+
+
+def test_invoke_reasoning() -> None:
+    """Test reasoning(thinking) from ChatClovaX."""
+    llm = ChatClovaX(
+        model="HCX-007",
+        max_completion_tokens=5120,  # or max_tokens=5120
+        reasoning_effort="low",  # or thinking={"effort": "low"},
+    )
+
+    response = llm.invoke("What is the cube root of 50.653?")
+
+    assert isinstance(response, AIMessage)
+    assert isinstance(response.content, str)
+    assert len(response.content) > 0
+    assert "thinking_content" in response.additional_kwargs
+    assert response.type == "ai"
+    if response.response_metadata:
+        assert response.response_metadata["model_name"]
+        assert response.response_metadata["finish_reason"]
+        if "token_usage" in response.response_metadata:
+            token_usage = response.response_metadata["token_usage"]
+            assert token_usage["completion_tokens"]
+            assert token_usage["prompt_tokens"]
+            assert token_usage["total_tokens"]
+            if "completion_tokens_details" in token_usage:
+                completion_tokens_details = token_usage["completion_tokens_details"]
+                assert completion_tokens_details["reasoning_tokens"] >= 0
+
+
+def test_stream_reasoning() -> None:
+    """Test reasoning(thinking) streaming tokens from ChatClovaX."""
+    llm = ChatClovaX(
+        model="HCX-007",
+        max_completion_tokens=5120,  # or max_tokens=5120
+        reasoning_effort="low",  # or thinking={"effort": "low"},
+    )
+    messages = [
+        (
+            "system",
+            "CLOVA Studio는 HyperCLOVA X 모델을 활용하여 AI 서비스를 손쉽게 만들 수 "
+            "있는 개발 도구입니다.",
+        ),
+        (
+            "human",
+            "What is the cube root of 50.653?",
+        ),
+    ]
+    for token in llm.stream(messages):
+        if isinstance(token, AIMessageChunk):
+            assert isinstance(token.content, str)
+            assert "thinking_content" in token.additional_kwargs
+        if token.response_metadata:
+            assert token.response_metadata["model_name"]
+            assert token.response_metadata["finish_reason"]
+            if "token_usage" in token.response_metadata:
+                token_usage = token.response_metadata["token_usage"]
+                assert token_usage["completion_tokens"]
+                assert token_usage["prompt_tokens"]
+                assert token_usage["total_tokens"]
+
+
+def test_invoke_structured_output() -> None:
+    """Test structured output from ChatClovaX."""
+
+    class ResponseFormatter(BaseModel):
+        """Always use this tool to structure your response to the user."""
+
+        answer: str = Field(description="The answer to the user's question")
+        followup_question: str = Field(
+            description="A followup question the user could ask"
+        )
+
+    llm = ChatClovaX(
+        model="HCX-007",
+        max_completion_tokens=5120,  # or max_tokens=5120
+        reasoning_effort="none",  # or  thinking = {"effort": "none"},
+        disabled_params={"parallel_tool_calls": None},
+    )
+    # Bind the schema to the model
+    model_with_structure = llm.with_structured_output(ResponseFormatter)
+    # Invoke the model
+    structured_output = model_with_structure.invoke(
+        "What is the powerhouse of the cell?"
+    )
+    # Get back the pydantic object
+    assert isinstance(structured_output, ResponseFormatter)
+    assert len(structured_output.answer) > 0
+    assert len(structured_output.followup_question) > 0
+
+
+class SimpleTest(BaseModel):
+    """Simple test model for structured output"""
+
+    message: str = Field(description="Test message")
+    success: bool = Field(description="Success status")
+
+
+async def test_ainvoke_structured_output() -> None:
+    """Test ainvoke structured output from ChatClovaX."""
+    llm = ChatClovaX(
+        model="HCX-007", thinking={"effort": "none"}, max_completion_tokens=256
+    )
+
+    model_with_structure = llm.with_structured_output(SimpleTest, method="json_schema")
+    result = await model_with_structure.ainvoke(
+        [("human", "Generate a test message. Set success to true.")]
+    )
+    assert isinstance(result, SimpleTest)
+    assert len(result.message) > 0
+    assert isinstance(result.success, bool)
+
+
+@pytest.mark.skip(reason="structured_output model known issue")
+async def test_astream_structured_output() -> None:
+    """Test astream structured output from ChatClovaX."""
+    llm = ChatClovaX(
+        model="HCX-007", thinking={"effort": "none"}, max_completion_tokens=256
+    )
+
+    model_with_structure = llm.with_structured_output(SimpleTest, method="json_schema")
+
+    async for token in model_with_structure.astream(
+        [("human", "Generate a test message. Set success to true.")]
+    ):
+        assert isinstance(token, AIMessageChunk)
+        assert isinstance(token.content, str)
+        if token.response_metadata:
+            assert token.response_metadata["model_name"]
+            assert token.response_metadata["finish_reason"]
+            if "token_usage" in token.response_metadata:
+                token_usage = token.response_metadata["token_usage"]
+                assert token_usage["completion_tokens"]
+                assert token_usage["prompt_tokens"]
+                assert token_usage["total_tokens"]
