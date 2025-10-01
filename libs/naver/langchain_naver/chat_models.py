@@ -214,6 +214,9 @@ class ChatClovaX(BaseChatOpenAI):
             self.extra_body["repetition_penalty"] = self.repetition_penalty
         if self.repeat_penalty is not None:
             self.extra_body["repeat_penalty"] = self.repeat_penalty
+
+        if self.model_name == "HCX-007" and self.thinking is None:
+            self.thinking = {"effort": "none"}
         if self.thinking is not None and "effort" in self.thinking:
             self.reasoning_effort = self.thinking["effort"]
 
@@ -352,6 +355,19 @@ class ChatClovaX(BaseChatOpenAI):
         stop: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> dict:
+        if self.model_name == "HCX-007" and self.thinking.get("effort") != "none":
+            incompatible_features = {
+                "Function calling (tools)": kwargs.get("tools"),
+                "Structured Outputs (response_format)": "response_format" in kwargs,
+            }
+            for feature, is_present in incompatible_features.items():
+                if is_present:
+                    raise ValueError(
+                        f"Thinking (reasoning) and {feature} cannot be used "
+                        f"together in model '{self.model_name}'. Please set "
+                        "thinking={{'effort': 'none'}} or remove the incompatible feature."
+                    )
+
         messages = self._convert_input(input_).to_messages()
         if stop is not None:
             kwargs["stop"] = stop
